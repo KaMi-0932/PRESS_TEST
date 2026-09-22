@@ -1,0 +1,19 @@
+# ===== STM32 build output =====
+Debug/
+Release/
+build/
+
+# ===== Compiler output =====
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+
+# ===== VS Code =====
+.vscode/
+
+# ===== Logs =====
+*.log

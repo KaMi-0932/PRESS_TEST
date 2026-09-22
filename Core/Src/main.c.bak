@@ -1,0 +1,446 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define BOARD_W_MM       200.0f   /* 板宽 W（mm），按实际改 */
+#define BOARD_H_MM       150.0f   /* 板高 H（mm），按实际改 */
+#define HIT_THRESHOLD    0.3f     /* 击打阈值（V）：按压下降~0.4V，0.3V低于信号、高于空闲噪声 */
+#define HIT_WINDOW_MS    30       /* 击打后抓峰值的窗口 ms */
+#define BASELINE_SAMPLES 50       /* 开机采安静基线的次数 */
+#define LPF_ALPHA        0.1f     /* 一阶低通系数(0~1)；0.1 ≈ 16Hz 截止 @1kHz，270Hz 衰减约 14 倍 */
+#define BASELINE_BETA        0.0002f /* 基线慢跟踪系数(τ≈5s)：跟得上慢漂移，跟不动按压/尖峰 */
+#define OSC_WINDOW           20      /* 振荡幅度窗口：20样本=20ms，覆盖~5个270Hz周期 */
+#define OSC_ALPHA            0.05f   /* 振荡幅度低通系数(慢) */
+#define OSC_FLOOR_PRESS_TH   0.85f   /* 按压判定：近期下界>0.85V(无低点)=按压；空闲下界会掉到0.6 */
+#define OSC_FLOOR_REARM_TH   0.7f    /* 重新武装：近期下界<0.7V(有低点)=空闲 */
+#define OSC_FLOOR_LEAK       0.001f  /* 下界上回速率(V/ms)，约250ms遗忘一个低点 */
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc;
+DMA_HandleTypeDef hdma_adc;
+
+/* USER CODE BEGIN PV */
+volatile uint16_t adc_raw[4];   /* 4 raw ADC values, refreshed by circular DMA */
+volatile float    adc_vin[4];   /* 4 voltages (raw * 3.3 / 4095) */
+
+float            base[4] = {0};      /* 安静基线电压 */
+float            peak[4] = {0};      /* 冲击各通道峰值 */
+volatile float   vin_f[4] = {0};     /* 低通滤波后的电压（一阶EMA状态，滤270Hz共振）；volatile 便于 Ozone 观察 */
+volatile float   osc_amp = 0;        /* 振荡幅度(V)：原始信号20ms峰峰值，低通后 */
+volatile float   osc_floor = 2.0f;   /* 振荡幅度近期下界(V)：空闲~0.6、按压~1.0；供Ozone观察 */
+volatile float   hit_x = 0;          /* 击打位置 x（中心原点，右正左负） */
+volatile float   hit_y = 0;          /* 击打位置 y（中心原点，上正下负） */
+volatile uint32_t hit_count = 0;     /* 累计击打次数 */
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_ADC_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+/* 开机采 samples 次平均作为安静基线（此时板上不能有压力） */
+static void ADC_CalibrateBaseline(uint32_t samples)
+{
+  float sum[4] = {0, 0, 0, 0};
+  for (uint32_t k = 0; k < samples; k++)
+  {
+    for (int i = 0; i < 4; i++)
+      sum[i] += adc_raw[i] * 3.3f / 4095.0f;//注意：DMA一直在后台搬数据，所以raw值是在变的
+    HAL_Delay(1);
+  }
+  for (int i = 0; i < 4; i++)
+    base[i] = sum[i] / (float)samples;
+}
+
+/* ADC → 力 F 的转换（占位）。
+   用「电压 - 基线」当作 F（正比于力）。
+*/
+static float adc_to_F(float voltage, float baseline)
+{
+  float f = baseline - voltage;   /* 阶跃：按下时电压【下降】，所以 基线-电压 = 按压的力 */
+  if (f < 0) f = 0;
+  return f;
+}
+
+/* 一阶低通（指数滑动平均）：state += alpha * (x - state)。
+   每次 1ms 采样调用一次。用于滤掉 ~270Hz 机械共振（击打是 <50Hz 的慢信号）。 */
+static float lpf_update(float state, float x, float alpha)
+{
+  return state + alpha * (x - state);
+}
+
+/* 自适应基线：电压高于基线时较快跟上（跟踪空闲/向上漂移），
+   低于基线时极慢（按压不拉低基线）。
+   解决"固定基线采早/采错/漂移"导致的 hit_count 自增或永远为 0。 */
+static float baseline_track(float base, float v)
+{
+  return base + BASELINE_BETA * (v - base);   /* 对称慢跟踪：不追尖峰也不追按压 */
+}
+
+/* 振荡幅度检测：手指压上会压死 270Hz 共振，振荡幅度骤降。
+   每 1ms 调用一次，更新全局 osc_amp（峰峰值，低通后）。空闲~1V，按压~0.1V。 */
+static void osc_update(uint16_t raw)
+{
+  static uint16_t buf[OSC_WINDOW];
+  static uint8_t  idx = 0;
+  buf[idx] = raw;
+  idx = (idx + 1) % OSC_WINDOW;
+  uint16_t mn = 4095, mx = 0;
+  for (int i = 0; i < OSC_WINDOW; i++) {
+    if (buf[i] < mn) mn = buf[i];
+    if (buf[i] > mx) mx = buf[i];
+  }
+  float amp = (mx - mn) * 3.3f / 4095.0f;
+  osc_amp = lpf_update(osc_amp, amp, OSC_ALPHA);
+
+  /* 下界(近期最低)：快速下跟、缓慢上回。空闲掉到0.6，按压停在1.0 */
+  osc_floor = (osc_amp < osc_floor + OSC_FLOOR_LEAK) ? osc_amp : (osc_floor + OSC_FLOOR_LEAK);
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_ADC_Init();
+  /* USER CODE BEGIN 2 */
+  /* Calibrate ADC, then start continuous scan (4ch: IN3~IN6) via circular DMA */
+  HAL_ADCEx_Calibration_Start(&hadc);
+  HAL_ADC_Start_DMA(&hadc, (uint32_t*)adc_raw, 4);
+
+  /* 开机采安静基线（此刻不要碰板子） */
+  HAL_Delay(2000);  /* 传感器开机有~1~2s慢速爬升(实测1.43V→1.65V)，必须等稳定再采基线 */
+  ADC_CalibrateBaseline(BASELINE_SAMPLES);
+
+  /* 用基线初始化滤波器状态，避免启动瞬态误触发 */
+  for (int i = 0; i < 4; i++) vin_f[i] = base[i];
+
+  uint8_t armed = 1;   /* 击打检测状态机：1=可触发，0=等回落 */
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* ---- 1. 原始 ADC → 电压 → 滤波 + 自适应基线（供峰值/重心用） ---- */
+    for (int i = 0; i < 4; i++)
+    {
+      adc_vin[i] = adc_raw[i] * 3.3f / 4095.0f;   /* ADC → 电压 */
+      vin_f[i]  = lpf_update(vin_f[i], adc_vin[i], LPF_ALPHA);  /* 低通滤 270Hz 共振 */
+      base[i]   = baseline_track(base[i], vin_f[i]);            /* 自适应基线跟踪空闲 */
+    }
+
+    /* ---- 2. 振荡幅度(270Hz) → 按压检测：手指压上会压死共振，幅度骤降 ---- */
+    osc_update(adc_raw[0]);
+
+    if (armed)
+    {
+      if (osc_floor > OSC_FLOOR_PRESS_TH)
+      {
+        /* ---- 3. 触发后开 HIT_WINDOW_MS 窗口抓各通道峰值 ---- */
+        for (int i = 0; i < 4; i++) peak[i] = 0;
+        uint32_t t0 = HAL_GetTick();
+        while (HAL_GetTick() - t0 < HIT_WINDOW_MS)
+        {
+          for (int i = 0; i < 4; i++)
+          {
+            float v = adc_raw[i] * 3.3f / 4095.0f;
+            vin_f[i] = lpf_update(vin_f[i], v, LPF_ALPHA);   /* 同样走滤波，保持 1ms 采样 */
+            float f = adc_to_F(vin_f[i], base[i]);
+            if (f > peak[i]) peak[i] = f;
+          }
+          HAL_Delay(1);   /* 保持 1ms 采样率，滤波系数才对应 ~16Hz 截止 */
+        }
+
+        /* ---- 4. 峰值重心 → 位置（中心原点，四象限）----
+           象限映射：ch0 右上(第一)、ch1 左上(第二)、
+                     ch2 左下(第三)、ch3 右下(第四) ---- */
+        float Sp = peak[0] + peak[1] + peak[2] + peak[3];
+        if (Sp > 1e-3f)
+        {
+          hit_x = (BOARD_W_MM / 2.0f) * ((peak[0] + peak[3]) - (peak[1] + peak[2])) / Sp;
+          hit_y = (BOARD_H_MM / 2.0f) * ((peak[0] + peak[1]) - (peak[2] + peak[3])) / Sp;
+          hit_count++;
+        }
+        armed = 0;   /* 等回落，防止同一次击打重复算 */
+      }
+    }
+    else
+    {
+      /* ---- 5. 下界掉回(手指离开，低点恢复) → 重新武装 ---- */
+      if (osc_floor < OSC_FLOOR_REARM_TH)
+        armed = 1;
+    }
+
+    HAL_Delay(1);   /* 采样周期 1ms */
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_HSI14;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSI14State = RCC_HSI14_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.HSI14CalibrationValue = 16;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL12;
+  RCC_OscInitStruct.PLL.PREDIV = RCC_PREDIV_DIV1;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC_Init(void)
+{
+
+  /* USER CODE BEGIN ADC_Init 0 */
+
+  /* USER CODE END ADC_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC_Init 1 */
+
+  /* USER CODE END ADC_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc.Instance = ADC1;
+  hadc.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
+  hadc.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc.Init.ScanConvMode = ADC_SCAN_DIRECTION_FORWARD;
+  hadc.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc.Init.LowPowerAutoWait = DISABLE;
+  hadc.Init.LowPowerAutoPowerOff = DISABLE;
+  hadc.Init.ContinuousConvMode = ENABLE;
+  hadc.Init.DiscontinuousConvMode = DISABLE;
+  hadc.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc.Init.DMAContinuousRequests = ENABLE;
+  hadc.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  if (HAL_ADC_Init(&hadc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel to be converted.
+  */
+  sConfig.Channel = ADC_CHANNEL_3;
+  sConfig.Rank = ADC_RANK_CHANNEL_NUMBER;
+  sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
+  if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel to be converted.
+  */
+  sConfig.Channel = ADC_CHANNEL_4;
+  if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel to be converted.
+  */
+  sConfig.Channel = ADC_CHANNEL_5;
+  if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel to be converted.
+  */
+  sConfig.Channel = ADC_CHANNEL_6;
+  if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC_Init 2 */
+
+  /* USER CODE END ADC_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  // HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);   /* 轮询 adc_raw 不需要 DMA 中断；开着会以最高优先级疯狂触发、饿死 SysTick 导致 HAL_Delay 卡死/跑飞 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /* ADC 通道 PA3~PA6 必须配成模拟模式（禁用数字输入缓冲），否则引脚悬空时
+     数字施密特缓冲会在阈值附近抖动，干扰 ADC 采样。原来漏配了这一项。 */
+  GPIO_InitStruct.Pin   = GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6;
+  GPIO_InitStruct.Mode  = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

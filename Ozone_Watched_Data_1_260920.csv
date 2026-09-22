@@ -1,0 +1,6 @@
+Level,Expression,Value,Location,Refresh
+0,"adc_raw",,0x200000A8,"5 Hz"
+ 1,"[0]",1192,0x200000A8,"5 Hz"
+ 1,"[1]",1217,0x200000AA,"5 Hz"
+ 1,"[2]",1,0x200000AC,"5 Hz"
+ 1,"[3]",4028,0x200000AE,"5 Hz"
